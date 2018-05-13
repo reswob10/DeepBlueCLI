@@ -18,6 +18,11 @@ import base64
 import os.path
 import string
 from subprocess import Popen, PIPE
+import socket
+
+
+#
+
 
 def filter(str):
     # Used to convert base64 decoded data (unicode) to ASCII
@@ -45,7 +50,7 @@ def CheckObfu(cli,minpercent,minlength):
             string += " - Potential command obfuscation: "+str(int(percent))+"% alpha characters"
     return(string)
 
-def CheckCommand(time, log, eventid, cli):
+def CheckCommand(time, log, eventid, cli, host, user):
     minpercent=.65
     minlength=25 # Minimum CLI length to check for obfuscation
     string=""
@@ -59,9 +64,12 @@ def CheckCommand(time, log, eventid, cli):
         string+=CheckRegex(regexes,decoded)
     string += CheckObfu(cli,minpercent,minlength) 
     if(string):
-        print "Date: %s\nLog: %s\nEventID: %s" % (time,log,eventid)
-        print "Results:\n%s\n" % (string.rstrip())
-        print "Command:  %s\n" % (cli)
+		# put syslog send alert function here where it will be sent to SIEM
+		print "Host: %s " % host
+		print "User: %s " % user
+		print "Date: %s\nLog: %s\nEventID: %s" % (time,log,eventid)
+		print "Results:\n%s\n" % (string.rstrip())
+		print "Command:  %s\n" % (cli)
     if(decoded):
         print "Decoded: %s" % (decoded)
     if(string):
@@ -70,7 +78,63 @@ def CheckCommand(time, log, eventid, cli):
 filename=""
 regexfile="regexes.txt"
 regexes=[]
-if len(sys.argv)==2:
+if len(sys.argv) < 2: 
+	print "WARN: No filename given, assuming that data is coming from network"
+	# set the host IP and the receive port
+	UDP_IP = "192.168.0.118"
+	UDP_PORT = 2514
+
+	# open the socket to listen
+	sock = socket.socket(socket.AF_INET, # Internet
+		socket.SOCK_DGRAM) # UDP
+		
+	sock.bind((UDP_IP, UDP_PORT))
+
+	# listen and capture sent logs
+	while True:
+		data, addr = sock.recvfrom(4096) # buffer size is 2048 bytes
+		#print "received message:", data
+		# Get info for security log event 4688
+		if re.search(r'EventID="4688"',data) or re.search(r'EventID="1"',data):
+			if re.search(r'CommandLine=',data):
+				commandline = re.search(r'CommandLine="(.*?)",',data)
+				#print commandline.group(1)
+				cli = commandline.group(1)
+				if re.search(r'EventID="4688"',data):
+					eventid="4688"
+					log="Microsoft-Windows-Security-Auditing"
+					getuser = re.search(r'SubjectUserName="(.*?)",',data)
+					user = getuser.group(1)
+				elif re.search(r'EventID="1"',data):
+					eventid="1"
+					log="Microsoft-Windows-Sysmon"
+					getuser = re.search(r'User="(.*?)",',data)
+					user1 = getuser.group(1)
+					user2 = user1.split('\\')
+					user = user2[1]
+
+		elif re.search(r'EventID="4104"',data):
+			if re.search(r'ScriptBlockText=', data):
+				commandline = re.search(r'ScriptBlockText="(.*?)",',data)
+				cli = commandline.group(1)
+				eventid = "4104"
+				log = "Microsoft-Windows-PowerShell/Operational"
+				getuser = re.search(r'SecurityUserName="(.*?)",',data)
+				user1 = getuser.group(1)
+				user2 = user1.split('\\')
+				user = user2[1]
+		time=data[:16]
+		gethostPT1 = re.search(r'.*?:\d+:\d+\s+(.*?)\s+',data)
+		host = gethostPT1.group(1)
+		print host
+		print cli
+		print eventid
+		print time
+		print user
+		CheckCommand(time,log,eventid,cli,host,user)
+
+# firgure out how to get host and user from evtx file
+elif len(sys.argv)==2:
     if os.path.isfile(sys.argv[1]):
         filename=sys.argv[1]
         if os.path.isfile(regexfile):
@@ -83,50 +147,56 @@ if len(sys.argv)==2:
             print "Error: cannot open "+regexfile+"\n" 
     else:
         print "Error: no such file: %s\n" % (sys.argv)
+	if (filename and regexes):
+		process=""
+		try:
+			process = Popen(['evtxexport', filename], stdout=PIPE, stderr=PIPE)
+		except:
+			print 'Can\'t find libevtx. Check the path and verify it is installed. See: https://github.com/libyal/libevtx'
+
+		if (process):
+			time=""
+			log=""
+			eventid=""
+			cli=""
+			path=""
+			host=""
+			user=""
+			for line in iter(process.stdout.readline,''):
+				if re.search("^Written time",line):
+					#Written time			: Aug 30, 2017 19:16:26.133985000 UTC
+					time = re.sub("^.*: ","",line)
+					time = time[:21]
+				elif re.search("^Source name",line):
+					log = re.sub("^.*: ","",line).rstrip()
+				elif re.search("^Event identifier",line):
+					# Looks like this, grab the number between the parentheses:
+					#Event identifier		: 0x00001008 (4104)
+					#Event identifier		: 0x00000001 (1)
+					eventid = re.sub("^.*\(","",line.rstrip())
+					eventid = re.sub("\).*$","",eventid)
+				elif re.search("^String: 3",line):
+					#Source name			: Microsoft-Windows-PowerShell
+					if log=="Microsoft-Windows-PowerShell":
+						cli = line[14:].rstrip()
+				elif re.search("^String: 5",line):
+					if log=="Microsoft-Windows-PowerShell":
+						path = line[14:].rstrip()
+					elif log=="Microsoft-Windows-Sysmon":
+						cli = line[14:].rstrip()
+				elif re.search("^String: 9",line):
+					if log=="Microsoft-Windows-Security-Auditing":
+						cli = line[14:].rstrip()
+				elif re.search("^$",line):
+					# 4688: CLI via System log
+					# 4104: PowerShell CLI if path is blank (non-blank path == PowerShell script)
+					#    1: Sysmon CLI 
+					if ((eventid=="4688")or(eventid=="1")or((eventid=="4104")and(path==""))):
+						CheckCommand(time,log,eventid,cli,host,user)
 else:
     print "Error: filename required as an argument\n"
+#
 
-if (filename and regexes):
-    process=""
-    try:
-        process = Popen(['evtxexport', filename], stdout=PIPE, stderr=PIPE)
-    except:
-        print 'Can\'t find libevtx. Check the path and verify it is installed. See: https://github.com/libyal/libevtx'
 
-    if (process):
-        time=""
-        log=""
-        eventid=""
-        cli=""
-        path=""
-        for line in iter(process.stdout.readline,''):
-            if re.search("^Written time",line):
-                #Written time			: Aug 30, 2017 19:16:26.133985000 UTC
-                time = re.sub("^.*: ","",line)
-                time = time[:21]
-            elif re.search("^Source name",line):
-                log = re.sub("^.*: ","",line).rstrip()
-            elif re.search("^Event identifier",line):
-                # Looks like this, grab the number between the parentheses:
-                #Event identifier		: 0x00001008 (4104)
-                #Event identifier		: 0x00000001 (1)
-                eventid = re.sub("^.*\(","",line.rstrip())
-                eventid = re.sub("\).*$","",eventid)
-            elif re.search("^String: 3",line):
-                #Source name			: Microsoft-Windows-PowerShell
-                if log=="Microsoft-Windows-PowerShell":
-                    cli = line[14:].rstrip()
-            elif re.search("^String: 5",line):
-                if log=="Microsoft-Windows-PowerShell":
-                    path = line[14:].rstrip()
-                elif log=="Microsoft-Windows-Sysmon":
-                    cli = line[14:].rstrip()
-            elif re.search("^String: 9",line):
-                if log=="Microsoft-Windows-Security-Auditing":
-                    cli = line[14:].rstrip()
-            elif re.search("^$",line):
-                # 4688: CLI via System log
-                # 4104: PowerShell CLI if path is blank (non-blank path == PowerShell script)
-                #    1: Sysmon CLI 
-                if ((eventid=="4688")or(eventid=="1")or((eventid=="4104")and(path==""))):
-                    CheckCommand(time,log,eventid,cli)
+			
+			
